@@ -23,7 +23,8 @@ from aiogram.enums import ParseMode
 import asyncio
 
 # ===== НАСТРОЙКИ =====
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04")
+# Вставлен ваш токен (настоятельно рекомендую отозвать и использовать os.getenv)
+BOT_TOKEN = "9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04"
 DB_FILE = 'game_state.json'
 
 RINGS = 8
@@ -155,12 +156,13 @@ def bfs_within_radius(src, radius):
 def is_neighbor(src, dst):
     return dst in neighbors(src)
 
-# ===== КАРТА =====
+# ===== КАРТА (С УНИКАЛЬНЫМ ИМЕНЕМ И РАЗНЕСЕННЫМИ ИКОНКАМИ) =====
 def draw_map():
     fig, ax = plt.subplots(figsize=(12, 12), subplot_kw={'aspect': 'equal'})
     ax.set_xlim(-1.05, 1.05)
     ax.set_ylim(-1.05, 1.05)
     ax.axis('off')
+    
     for ring in range(RINGS):
         r_outer = (ring + 1) / RINGS
         r_inner = ring / RINGS
@@ -173,30 +175,50 @@ def draw_map():
             if info and info.get("owner"):
                 country = db["countries"].get(info["owner"])
                 color = country["color"] if country else "#CCCCCC"
+            
             wedge = Wedge((0, 0), r_outer, theta1, theta2, width=r_outer - r_inner,
                           facecolor=color, edgecolor='gray', linewidth=0.6)
             ax.add_patch(wedge)
+            
+            # Центр сектора для базовой точки
             mid_theta = (theta1 + theta2) / 2
             mid_r = (r_outer + r_inner) / 2
             x = mid_r * math.cos(math.radians(mid_theta))
             y = mid_r * math.sin(math.radians(mid_theta))
+            
+            # Смещения для иконок (чтобы не накладывались)
+            # Угол в радианах для смещения
+            angle_rad = math.radians(mid_theta)
+            offset_dist = 0.04 * (ring + 1) / RINGS  # Чем дальше от центра, тем больше смещение
+            
+            # 1. Войска (черная точка) - смещена влево-вниз
             total_army = sum(
                 data.get("count", 0) for c_data in db["armies"].values()
                 for s, data in c_data.items() if s == sid
             )
             if total_army > 0:
-                ax.plot(x, y, 'ko', markersize=4)
+                ax.plot(x - offset_dist*0.5, y - offset_dist*0.5, 'ko', markersize=4)
+            
+            # 2. Столица (звезда) - смещена вправо-вверх
             if info and info.get("owner"):
                 c_data = db["countries"].get(info["owner"])
                 if c_data and c_data.get("capital") == sid:
-                    ax.plot(x, y, marker='*', color='gold', markeredgecolor='black', markersize=16, zorder=10)
+                    ax.plot(x + offset_dist*0.5, y + offset_dist*0.5, marker='*', color='gold', 
+                            markeredgecolor='black', markersize=16, zorder=10)
+            
+            # 3. Герой (ромб) - смещен вправо-вниз
             heroes_here = [h for h in db["heroes"].values() if h.get("sector") == sid and h.get("alive")]
             if heroes_here:
-                ax.plot(x, y, marker='D', color='lime', markeredgecolor='black', markersize=8, zorder=9)
+                ax.plot(x + offset_dist*0.5, y - offset_dist*0.5, marker='D', color='lime', 
+                        markeredgecolor='black', markersize=8, zorder=9)
+
     ax.add_patch(plt.Circle((0, 0), 1/RINGS, color='white', ec='gray', linewidth=1))
-    plt.savefig('map.png', dpi=120, bbox_inches='tight', transparent=True)
+    
+    # Уникальное имя файла, чтобы Telegram не кешировал
+    filename = f'map_{int(time.time())}.png'
+    plt.savefig(filename, dpi=120, bbox_inches='tight', transparent=True)
     plt.close()
-    return 'map.png'
+    return filename
 
 # ===== СТАРТ =====
 @dp.message(Command("start"))
@@ -366,7 +388,7 @@ async def move_hero(message: Message):
     save_db(db)
     await message.answer(f'🚶 Герой в <code>{sector}</code>.', parse_mode=ParseMode.HTML)
 
-# ===== АТАКА ГЕРОЕМ (через текст) =====
+# ===== АТАКА ГЕРОЕМ =====
 @dp.message(F.text.regexp(r'^\.атаковать\s+(R\d+-S\d+)$'))
 async def hero_attack_cmd(message: Message):
     sector = message.text.split()[1].upper()
@@ -510,6 +532,7 @@ async def atk_amount_chosen(message: Message, state: FSMContext):
     await state.set_state(AttackFlow.choose_dst)
 
     src = data["src"]
+    # Показываем ВСЕ соседние сектора (включая свободные и чужие)
     neighbors_list = neighbors(src)
     buttons = []
     for nb in neighbors_list:
