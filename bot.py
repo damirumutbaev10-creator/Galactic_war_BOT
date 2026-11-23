@@ -103,13 +103,12 @@ def load_db():
             return json.load(f)
     return {
         "factions": {
-            "super_earth": {"president": None, "members": [], "soldiers": {}, "heroes": {}, "production_pool": 0},
-            "automatons": {"president": None, "members": [], "soldiers": {}, "heroes": {}, "production_pool": 0},
-            "terminids": {"president": None, "members": [], "soldiers": {}, "heroes": {}, "production_pool": 0},
-            "illuminate": {"president": None, "members": [], "soldiers": {}, "heroes": {}, "production_pool": 0}
+            "super_earth": {"president": None, "members": [], "soldiers": {}, "heroes": {}},
+            "automatons": {"president": None, "members": [], "soldiers": {}, "heroes": {}},
+            "terminids": {"president": None, "members": [], "soldiers": {}, "heroes": {}},
+            "illuminate": {"president": None, "members": [], "soldiers": {}, "heroes": {}}
         },
         "sectors": {},
-        "worlds": {},
         "pending_attacks": {},
         "last_day_reset": ""
     }
@@ -124,15 +123,9 @@ db = load_db()
 def init_factions():
     for fid, faction in FACTIONS.items():
         if fid not in db["factions"]:
-            db["factions"][fid] = {"president": None, "members": [], "soldiers": {}, "heroes": {}, "production_pool": 0}
-        if "production_pool" not in db["factions"][fid]:
-            db["factions"][fid]["production_pool"] = 0
+            db["factions"][fid] = {"president": None, "members": [], "soldiers": {}, "heroes": {}}
         for sector in FACTION_TERRITORIES[fid]:
             db["sectors"][sector] = {"owner": fid, "status": "captured"}
-            if sector == faction["capital"]:
-                db["worlds"][sector] = {"type": "людской", "country": fid}
-            elif sector not in db["worlds"]:
-                db["worlds"][sector] = {"type": "кузня" if random.random() < 0.5 else "людской", "country": fid}
     save_db(db)
 
 init_factions()
@@ -469,31 +462,19 @@ async def btn_my_faction(message: Message):
     faction = FACTIONS[fid]
     role = "👑 Президент" if is_president(user_id, fid) else "🦸 Герой"
     territories = [s for s, info in db["sectors"].items() if info.get("owner") == fid]
-    kuzni = [s for s, w in db["worlds"].items() if w.get("country") == fid and w["type"] == "кузня"]
-    lyudi = [s for s, w in db["worlds"].items() if w.get("country") == fid and w["type"] == "людской"]
     day = current_day_id()
     total_soldiers = len(f["soldiers"])
     ready = sum(1 for s in f["soldiers"].values() if s.get("unique", False) or s["acted"] != day)
     heroes_alive = len([h for h in f["heroes"].values() if h.get("alive")])
     unique_info = f'\n🦾 Уникальный юнит: <b>{faction["unique_unit"]}</b> (сила {faction["unique_power"]}, 3 атаки/день)' if faction["unique_unit"] else ""
-    
-    # Расчёт потенциального производства
-    base = min(len(kuzni), len(lyudi))
-    prod = base * faction["production_per_sector"]
-    pool = f.get("production_pool", 0)
-    total_pool = pool + prod
-    potential = int(total_pool)
-    
     await message.answer(
         f'🏛 <b>{faction["name"]}</b>\n'
         f'👑 Президент: <code>{f["president"] or "нет"}</code>\n'
         f'👥 Участников: {len(f["members"])}\n'
         f'🗺 Территорий: {len(territories)}\n'
-        f'🏭 Кузни: {len(kuzni)} | Людские: {len(lyudi)}\n'
         f'🏙 Столица: <code>{faction["capital"]}</code>\n'
         f'⚔️ Солдат: {total_soldiers} (готовы: {ready})\n'
         f'🦸 Героев: {heroes_alive}{unique_info}\n'
-        f'🏭 Накоплено производства: {total_pool:.1f} (можно создать: {potential})\n'
         f'🎖 Ваша роль: {role}',
         parse_mode=ParseMode.HTML)
 
@@ -738,66 +719,76 @@ async def btn_garrisons(message: Message):
     lines.append(f'\n<b>Итого:</b> {ta} солдат, {tr} готовы.')
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
-# ===== ПРОИЗВОДСТВО (с выбором) =====
+# ===== ПРОИЗВОДСТВО (от секторов, уникальный за 7) =====
 @dp.message(F.text == "🏭 Произвести")
 async def btn_produce(message: Message):
     user_id = str(message.from_user.id)
     fid = get_user_faction(user_id)
     if not fid:
-        await message.answer('❌ Вы не в фракции.'); return
-    if not is_president(user_id, fid):
-        await message.answer('❌ Только президент.'); return
-    
-    kuzni = [s for s, w in db["worlds"].items() if w.get("country") == fid and w["type"] == "кузня"]
-    lyudi = [s for s, w in db["worlds"].items() if w.get("country") == fid and w["type"] == "людской"]
-    if not kuzni or not lyudi:
-        await message.answer('❌ Нужна хотя бы 1 кузня и 1 людской мир.'); return
-    
-    # Добавляем к накопленному пулу
-    base = min(len(kuzni), len(lyudi))
-    production = FACTIONS[fid]["production_per_sector"]
-    earned = base * production
-    db["factions"][fid]["production_pool"] = db["factions"][fid].get("production_pool", 0) + earned
-    pool = db["factions"][fid]["production_pool"]
-    save_db(db)
-    
-    # Сколько можно создать
-    available_soldiers = int(pool)
-    if available_soldiers < 1:
-        await message.answer(f'🏭 Накоплено {pool:.1f} производства. Нужно хотя бы 1.0 для солдата.', parse_mode=ParseMode.HTML)
+        await message.answer('❌ Вы не в фракции.')
         return
-    
-    unique_unit = FACTIONS[fid]["unique_unit"]
-    
-    # Если есть уникальный юнит и хватает на него (3 солдата) — предлагаем выбор
-    if unique_unit and available_soldiers >= 3:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"⚔️ Создать {available_soldiers} солдат", callback_data=f"prod_soldiers_{fid}_{available_soldiers}")],
-            [InlineKeyboardButton(text=f"🦾 Создать {unique_unit} (стоит 3)", callback_data=f"prod_unique_{fid}")]
-        ])
+    if not is_president(user_id, fid):
+        await message.answer('❌ Только президент.')
+        return
+
+    my_sectors = [s for s, info in db["sectors"].items() if info.get("owner") == fid]
+    total_sectors = len(my_sectors)
+
+    if total_sectors == 0:
+        await message.answer('❌ У вас нет секторов.')
+        return
+
+    faction = FACTIONS[fid]
+    unique_unit = faction["unique_unit"]
+
+    if fid == "super_earth":
+        soldiers_count = total_sectors
+    else:
+        soldiers_count = total_sectors // 2
+
+    can_create_unique = unique_unit is not None and total_sectors >= 7
+
+    if can_create_unique:
+        buttons = []
+        if soldiers_count >= 1:
+            buttons.append([InlineKeyboardButton(
+                text=f"⚔️ Создать {soldiers_count} солдат",
+                callback_data=f"prod_soldiers_{fid}_{soldiers_count}"
+            )])
+        buttons.append([InlineKeyboardButton(
+            text=f"🦾 Создать {unique_unit} (7 секторов)",
+            callback_data=f"prod_unique_{fid}"
+        )])
         await message.answer(
             f'🏭 <b>Производство</b>\n\n'
-            f'Накоплено: <b>{pool:.1f}</b>\n'
-            f'Доступно солдат: <b>{available_soldiers}</b>\n\n'
+            f'Ваших секторов: <b>{total_sectors}</b>\n'
+            f'Доступно солдат: <b>{soldiers_count}</b>\n'
+            f'Уникальный юнит: <b>{unique_unit}</b> (стоит 7 секторов)\n\n'
             f'Что создаём?',
-            reply_markup=kb,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode=ParseMode.HTML
         )
-    else:
-        # Только солдаты
-        capital = FACTIONS[fid]["capital"]
-        created = 0
-        for _ in range(available_soldiers):
-            sid = next_soldier_id(fid)
-            db["factions"][fid]["soldiers"][sid] = {"sector": capital, "acted": ""}
-            created += 1
-        db["factions"][fid]["production_pool"] = pool - available_soldiers
-        save_db(db)
+        return
+
+    if soldiers_count < 1:
         await message.answer(
-            f'⚔️ Создано <b>{created}</b> солдат в столице <code>{capital}</code>!\n'
-            f'Остаток производства: {db["factions"][fid]["production_pool"]:.1f}',
+            f'🏭 Недостаточно секторов для производства.\n'
+            f'Ваших секторов: {total_sectors}\n'
+            f'Для 1 солдата нужно 2 сектора (у не-Супер-Земли), для уникального — 7.',
             parse_mode=ParseMode.HTML
         )
+        return
+
+    capital = FACTIONS[fid]["capital"]
+    for _ in range(soldiers_count):
+        sid = next_soldier_id(fid)
+        db["factions"][fid]["soldiers"][sid] = {"sector": capital, "acted": ""}
+    save_db(db)
+    await message.answer(
+        f'⚔️ Создано <b>{soldiers_count}</b> солдат в столице <code>{capital}</code>!\n'
+        f'Ваших секторов: {total_sectors}',
+        parse_mode=ParseMode.HTML
+    )
 
 @dp.callback_query(F.data.startswith("prod_soldiers_"))
 async def prod_soldiers_callback(callback: CallbackQuery):
@@ -806,17 +797,15 @@ async def prod_soldiers_callback(callback: CallbackQuery):
     amount = int(parts[3])
     user_id = str(callback.from_user.id)
     if not is_president(user_id, fid):
-        await callback.answer('Только президент!', show_alert=True); return
-    
+        await callback.answer('Только президент!', show_alert=True)
+        return
     capital = FACTIONS[fid]["capital"]
     for _ in range(amount):
         sid = next_soldier_id(fid)
         db["factions"][fid]["soldiers"][sid] = {"sector": capital, "acted": ""}
-    db["factions"][fid]["production_pool"] -= amount
     save_db(db)
     await callback.message.edit_text(
-        f'⚔️ Создано <b>{amount}</b> солдат в столице <code>{capital}</code>!\n'
-        f'Остаток производства: {db["factions"][fid]["production_pool"]:.1f}',
+        f'⚔️ Создано <b>{amount}</b> солдат в столице <code>{capital}</code>!',
         parse_mode=ParseMode.HTML
     )
     await callback.answer()
@@ -826,20 +815,18 @@ async def prod_unique_callback(callback: CallbackQuery):
     fid = callback.data.split("_")[2]
     user_id = str(callback.from_user.id)
     if not is_president(user_id, fid):
-        await callback.answer('Только президент!', show_alert=True); return
-    
+        await callback.answer('Только президент!', show_alert=True)
+        return
     capital = FACTIONS[fid]["capital"]
     unique_unit = FACTIONS[fid]["unique_unit"]
     sid = next_unique_id(fid)
     db["factions"][fid]["soldiers"][sid] = {
         "sector": capital, "acted": "", "unique": True, "uses_today": 0
     }
-    db["factions"][fid]["production_pool"] -= 3
     save_db(db)
     await callback.message.edit_text(
         f'🦾 Создан <b>{unique_unit}</b> в столице <code>{capital}</code>!\n'
-        f'Сила: {FACTIONS[fid]["unique_power"]}, атак в день: {UNIQUE_USES}\n'
-        f'Остаток производства: {db["factions"][fid]["production_pool"]:.1f}',
+        f'Сила: {FACTIONS[fid]["unique_power"]}, атак в день: {UNIQUE_USES}',
         parse_mode=ParseMode.HTML
     )
     await callback.answer()
@@ -876,13 +863,14 @@ async def btn_help(message: Message):
         "📖 <b>Команды:</b>\n\n"
         "<b>🌍 Фракция:</b> кнопки выбора\n\n"
         "<b>🦸 Герой:</b>\n<code>.двигаться R1-S5</code>\n<code>.атаковать R1-S5</code>\n\n"
-        "<b>👑 Президент:</b>\n• Атаковать\n• Переместить\n• Произвести (выбор: солдаты или супер-юнит)\n• Гарнизоны\n\n"
+        "<b>👑 Президент:</b>\n• Атаковать\n• Переместить\n• Произвести\n• Гарнизоны\n\n"
         "⚔️ <b>Правила:</b>\n"
         "• Атака — только соседний сектор\n"
         "• Перемещение — радиус 2\n"
         "• 1 ход на солдата, 3 хода на уникального\n"
-        "• Производство: 1 кузня + 1 людской = партия (0.5 или 1)\n"
-        "• 3 солдата = 1 супер-юнит\n\n"
+        "• Супер-Земля: 1 сектор = 1 солдат\n"
+        "• Остальные: 2 сектора = 1 солдат\n"
+        "• Уникальный юнит: 7 секторов\n\n"
         "📐 <code>R0-S1</code>…<code>R8-S24</code>",
         parse_mode=ParseMode.HTML)
 
