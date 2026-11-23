@@ -23,12 +23,12 @@ from aiogram.enums import ParseMode
 import asyncio
 
 # ===== НАСТРОЙКИ =====
-# Вставлен ваш токен (настоятельно рекомендую отозвать и использовать os.getenv)
 BOT_TOKEN = "9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04"
 DB_FILE = 'game_state.json'
 
-RINGS = 8
-SECTORS = 24
+RINGS = 9          # 0..8 (9 колец: центр + 8)
+CENTER_SECTORS = 8 # секторов в центре
+SECTORS = 24       # секторов во внешних кольцах
 HERO_POWER = 3
 RESPAWN_TIME = 3600
 MOVE_RADIUS = 2
@@ -116,28 +116,61 @@ def reset_actions():
     db["last_day_reset"] = day
     save_db(db)
 
-# ===== ГЕОМЕТРИЯ =====
+# ===== ГЕОМЕТРИЯ (центр + внешние кольца) =====
 def sector_id(ring, sec):
-    return f"R{ring+1}-S{sec+1}"
+    """ring 0 = центр (8 секторов), ring 1..8 = внешние (24 сектора)."""
+    return f"R{ring}-S{sec+1}"
 
 def parse_sector(sid):
     m = re.match(r'R(\d+)-S(\d+)', sid)
     if not m: return None
-    r = int(m.group(1)) - 1
+    r = int(m.group(1))
     s = int(m.group(2)) - 1
-    if 0 <= r < RINGS and 0 <= s < SECTORS:
-        return (r, s)
+    if r == 0:
+        if 0 <= s < CENTER_SECTORS: return (0, s)
+    elif 1 <= r <= 8:
+        if 0 <= s < SECTORS: return (r, s)
     return None
+
+def all_sectors():
+    res = []
+    for s in range(CENTER_SECTORS):
+        res.append(sector_id(0, s))
+    for r in range(1, RINGS):
+        for s in range(SECTORS):
+            res.append(sector_id(r, s))
+    return res
 
 def neighbors(sid):
     p = parse_sector(sid)
     if not p: return []
     r, s = p
     res = []
-    if r > 0: res.append(sector_id(r-1, s))
-    if r < RINGS-1: res.append(sector_id(r+1, s))
-    res.append(sector_id(r, (s-1) % SECTORS))
-    res.append(sector_id(r, (s+1) % SECTORS))
+    if r == 0:
+        # Центр: соседи по кругу (8) + внешнее кольцо 1 (соответствующий сектор)
+        res.append(sector_id(0, (s-1) % CENTER_SECTORS))
+        res.append(sector_id(0, (s+1) % CENTER_SECTORS))
+        # Каждому центральному сектору соответствует 3 сектора кольца 1 (24/8 = 3)
+        base = s * (SECTORS // CENTER_SECTORS)
+        for i in range(SECTORS // CENTER_SECTORS):
+            res.append(sector_id(1, (base + i) % SECTORS))
+    elif r == 1:
+        # Внутреннее кольцо (центр)
+        center_idx = s * CENTER_SECTORS // SECTORS  # 24/8 = 3
+        res.append(sector_id(0, center_idx % CENTER_SECTORS))
+        # Внешнее кольцо
+        res.append(sector_id(2, s))
+        # По кругу
+        res.append(sector_id(1, (s-1) % SECTORS))
+        res.append(sector_id(1, (s+1) % SECTORS))
+    else:
+        # Внутреннее кольцо
+        if r > 1: res.append(sector_id(r-1, s))
+        # Внешнее кольцо
+        if r < RINGS-1: res.append(sector_id(r+1, s))
+        # По кругу
+        res.append(sector_id(r, (s-1) % SECTORS))
+        res.append(sector_id(r, (s+1) % SECTORS))
     return res
 
 def bfs_within_radius(src, radius):
@@ -156,16 +189,51 @@ def bfs_within_radius(src, radius):
 def is_neighbor(src, dst):
     return dst in neighbors(src)
 
-# ===== КАРТА (С УНИКАЛЬНЫМ ИМЕНЕМ И РАЗНЕСЕННЫМИ ИКОНКАМИ) =====
+# ===== КАРТА (с центром) =====
 def draw_map():
-    fig, ax = plt.subplots(figsize=(12, 12), subplot_kw={'aspect': 'equal'})
-    ax.set_xlim(-1.05, 1.05)
-    ax.set_ylim(-1.05, 1.05)
+    fig, ax = plt.subplots(figsize=(14, 14), subplot_kw={'aspect': 'equal'})
+    ax.set_xlim(-1.1, 1.1)
+    ax.set_ylim(-1.1, 1.1)
     ax.axis('off')
-    
-    for ring in range(RINGS):
-        r_outer = (ring + 1) / RINGS
-        r_inner = ring / RINGS
+    # Центральный круг (R0)
+    center_radius = 1 / RINGS
+    for s in range(CENTER_SECTORS):
+        theta1 = s * (360 / CENTER_SECTORS)
+        theta2 = (s + 1) * (360 / CENTER_SECTORS)
+        sid = sector_id(0, s)
+        info = db["sectors"].get(sid)
+        color = "#F0F0F0"
+        if info and info.get("owner"):
+            country = db["countries"].get(info["owner"])
+            color = country["color"] if country else "#CCCCCC"
+        wedge = Wedge((0, 0), center_radius, theta1, theta2, width=center_radius,
+                      facecolor=color, edgecolor='gray', linewidth=0.6)
+        ax.add_patch(wedge)
+        mid_theta = (theta1 + theta2) / 2
+        mid_r = center_radius / 2
+        x0 = mid_r * math.cos(math.radians(mid_theta))
+        y0 = mid_r * math.sin(math.radians(mid_theta))
+        tx = -math.sin(math.radians(mid_theta))
+        ty = math.cos(math.radians(mid_theta))
+        total_army = sum(
+            data.get("count", 0) for c_data in db["armies"].values()
+            for sec, data in c_data.items() if sec == sid
+        )
+        if total_army > 0:
+            ax.plot(x0 - 0.015 * tx, y0 - 0.015 * ty, 'ko', markersize=4, zorder=8)
+        if info and info.get("owner"):
+            c_data = db["countries"].get(info["owner"])
+            if c_data and c_data.get("capital") == sid:
+                ax.plot(x0, y0, marker='*', color='gold', markeredgecolor='black',
+                        markersize=16, zorder=10)
+        heroes_here = [h for h in db["heroes"].values() if h.get("sector") == sid and h.get("alive")]
+        if heroes_here:
+            ax.plot(x0 + 0.015 * tx, y0 + 0.015 * ty, marker='D', color='lime',
+                    markeredgecolor='black', markersize=7, zorder=9)
+    # Внешние кольца 1..8
+    for ring in range(1, RINGS):
+        r_outer = ring / RINGS
+        r_inner = (ring - 1) / RINGS if ring > 1 else center_radius
         for sec in range(SECTORS):
             theta1 = sec * (360 / SECTORS)
             theta2 = (sec + 1) * (360 / SECTORS)
@@ -175,50 +243,33 @@ def draw_map():
             if info and info.get("owner"):
                 country = db["countries"].get(info["owner"])
                 color = country["color"] if country else "#CCCCCC"
-            
             wedge = Wedge((0, 0), r_outer, theta1, theta2, width=r_outer - r_inner,
                           facecolor=color, edgecolor='gray', linewidth=0.6)
             ax.add_patch(wedge)
-            
-            # Центр сектора для базовой точки
             mid_theta = (theta1 + theta2) / 2
             mid_r = (r_outer + r_inner) / 2
-            x = mid_r * math.cos(math.radians(mid_theta))
-            y = mid_r * math.sin(math.radians(mid_theta))
-            
-            # Смещения для иконок (чтобы не накладывались)
-            # Угол в радианах для смещения
-            angle_rad = math.radians(mid_theta)
-            offset_dist = 0.04 * (ring + 1) / RINGS  # Чем дальше от центра, тем больше смещение
-            
-            # 1. Войска (черная точка) - смещена влево-вниз
+            x0 = mid_r * math.cos(math.radians(mid_theta))
+            y0 = mid_r * math.sin(math.radians(mid_theta))
+            tx = -math.sin(math.radians(mid_theta))
+            ty = math.cos(math.radians(mid_theta))
             total_army = sum(
                 data.get("count", 0) for c_data in db["armies"].values()
                 for s, data in c_data.items() if s == sid
             )
             if total_army > 0:
-                ax.plot(x - offset_dist*0.5, y - offset_dist*0.5, 'ko', markersize=4)
-            
-            # 2. Столица (звезда) - смещена вправо-вверх
+                ax.plot(x0 - 0.025 * tx, y0 - 0.025 * ty, 'ko', markersize=4, zorder=8)
             if info and info.get("owner"):
                 c_data = db["countries"].get(info["owner"])
                 if c_data and c_data.get("capital") == sid:
-                    ax.plot(x + offset_dist*0.5, y + offset_dist*0.5, marker='*', color='gold', 
-                            markeredgecolor='black', markersize=16, zorder=10)
-            
-            # 3. Герой (ромб) - смещен вправо-вниз
+                    ax.plot(x0, y0, marker='*', color='gold', markeredgecolor='black',
+                            markersize=18, zorder=10)
             heroes_here = [h for h in db["heroes"].values() if h.get("sector") == sid and h.get("alive")]
             if heroes_here:
-                ax.plot(x + offset_dist*0.5, y - offset_dist*0.5, marker='D', color='lime', 
+                ax.plot(x0 + 0.025 * tx, y0 + 0.025 * ty, marker='D', color='lime',
                         markeredgecolor='black', markersize=8, zorder=9)
-
-    ax.add_patch(plt.Circle((0, 0), 1/RINGS, color='white', ec='gray', linewidth=1))
-    
-    # Уникальное имя файла, чтобы Telegram не кешировал
-    filename = f'map_{int(time.time())}.png'
-    plt.savefig(filename, dpi=120, bbox_inches='tight', transparent=True)
+    plt.savefig('map.png', dpi=120, bbox_inches='tight', transparent=True)
     plt.close()
-    return filename
+    return 'map.png'
 
 # ===== СТАРТ =====
 @dp.message(Command("start"))
@@ -271,14 +322,14 @@ async def create_color(message: Message, state: FSMContext):
         await message.answer('❌ Формат <code>#FF0000</code>:'); return
     await state.update_data(color=color)
     await state.set_state(CreateCountry.sector)
-    await message.answer('🏙 Сектор столицы (<code>R1-S1</code>):', parse_mode=ParseMode.HTML)
+    await message.answer('🏙 Сектор столицы (<code>R1-S1</code> или <code>R0-S1</code>):', parse_mode=ParseMode.HTML)
 
 @dp.message(CreateCountry.sector)
 async def create_sector(message: Message, state: FSMContext):
     sector = message.text.strip().upper()
-    valid = [f"R{r+1}-S{s+1}" for r in range(RINGS) for s in range(SECTORS)]
+    valid = all_sectors()
     if sector not in valid:
-        await message.answer('❌ Неверный сектор:'); return
+        await message.answer('❌ Неверный сектор. Формат: <code>R0-S1</code>…<code>R0-S8</code> или <code>R1-S1</code>…<code>R8-S24</code>', parse_mode=ParseMode.HTML); return
     if db["sectors"].get(sector, {}).get("owner"):
         await message.answer(f'❌ Сектор <code>{sector}</code> занят!', parse_mode=ParseMode.HTML); return
 
@@ -294,14 +345,13 @@ async def create_sector(message: Message, state: FSMContext):
     db["armies"][cid] = {sector: {"count": 1, "acted": []}}
     db["sectors"][sector] = {"owner": cid, "status": "captured"}
     db["worlds"][sector] = {"type": "людской", "country": cid}
-    db["heroes"][user_id] = {"sector": sector, "alive": True, "respawn_at": 0}
-
     save_db(db)
     await state.clear()
     await message.answer(
         f'🎉 Фракция <b>{data["name"]}</b> создана!\n'
         f'👑 Вы президент.\n'
-        f'🏙 Столица: <code>{sector}</code> (1 солдат)',
+        f'🏙 Столица: <code>{sector}</code> (1 солдат)\n'
+        f'⚠️ Как президент, вы не имеете героя. Управляйте армией через кнопки.',
         reply_markup=main_menu_kb(),
         parse_mode=ParseMode.HTML
     )
@@ -349,7 +399,8 @@ async def btn_hero(message: Message):
     user_id = str(message.from_user.id)
     hero = get_hero(user_id)
     if not hero:
-        await message.answer('❌ У вас нет героя.'); return
+        await message.answer('👑 Вы президент — у вас нет героя. Управляйте армией через «⚔️ Атаковать» и «📊 Гарнизоны».')
+        return
     cid = get_user_country(user_id)
     country = db["countries"].get(cid, {})
     if not hero["alive"]:
@@ -376,8 +427,8 @@ async def move_hero(message: Message):
     user_id = str(message.from_user.id)
     hero = get_hero(user_id)
     if not hero or not hero["alive"]:
-        await message.answer('❌ Герой недоступен.'); return
-    valid = [f"R{r+1}-S{s+1}" for r in range(RINGS) for s in range(SECTORS)]
+        await message.answer('❌ Герой недоступен (вы президент или герой мёртв).'); return
+    valid = all_sectors()
     if sector not in valid:
         await message.answer('❌ Неверный сектор.'); return
     cid = get_user_country(user_id)
@@ -532,7 +583,6 @@ async def atk_amount_chosen(message: Message, state: FSMContext):
     await state.set_state(AttackFlow.choose_dst)
 
     src = data["src"]
-    # Показываем ВСЕ соседние сектора (включая свободные и чужие)
     neighbors_list = neighbors(src)
     buttons = []
     for nb in neighbors_list:
@@ -920,7 +970,7 @@ async def btn_help(message: Message):
         "• Перемещение — радиус 2 по своей территории\n"
         "• 1 ход на солдата в день\n"
         "• Встречный бой при атаке 2 стран на 1 сектор\n\n"
-        "📐 Формат: <code>R1-S1</code> (R 1-8, S 1-24)",
+        "📐 Формат: <code>R0-S1</code> (центр), <code>R1-S1</code> (внешние, 1-8, 1-24)",
         parse_mode=ParseMode.HTML)
 
 # ===== НАЗНАЧИТЬ МИР =====
