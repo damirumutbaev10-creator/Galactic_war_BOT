@@ -11,7 +11,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message, FSInputFile, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,14 +23,14 @@ from aiogram.enums import ParseMode
 import asyncio
 
 # ===== НАСТРОЙКИ =====
-BOT_TOKEN = '9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04'
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", 9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04)
 DB_FILE = 'game_state.json'
 
 RINGS = 8
 SECTORS = 24
 HERO_POWER = 3
 RESPAWN_TIME = 3600
-MOVE_RADIUS = 2  # радиус перемещения по своей территории
+MOVE_RADIUS = 2
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -36,6 +40,11 @@ class CreateCountry(StatesGroup):
     name = State()
     color = State()
     sector = State()
+
+class AttackFlow(StatesGroup):
+    choose_src = State()
+    choose_amount = State()
+    choose_dst = State()
 
 # ===== БАЗА ДАННЫХ =====
 def load_db():
@@ -78,13 +87,12 @@ def main_menu_kb():
             [KeyboardButton(text="🌍 Создать фракцию"), KeyboardButton(text="🤝 Присоединиться")],
             [KeyboardButton(text="🏛 Моя страна"), KeyboardButton(text="🗺 Карта")],
             [KeyboardButton(text="⚔️ Атаковать"), KeyboardButton(text="🏭 Произвести")],
-            [KeyboardButton(text="🦸 Мой герой"), KeyboardButton(text="🏆 Лидеры")],
-            [KeyboardButton(text="📖 Помощь")],
+            [KeyboardButton(text="🦸 Мой герой"), KeyboardButton(text="📊 Гарнизоны")],
+            [KeyboardButton(text="🏆 Лидеры"), KeyboardButton(text="📖 Помощь")],
         ],
         resize_keyboard=True
     )
 
-# ===== НОРМАЛИЗАЦИЯ =====
 def normalize_armies():
     changed = False
     for cid in list(db["armies"].keys()):
@@ -97,7 +105,6 @@ def normalize_armies():
         save_db(db)
 normalize_armies()
 
-# ===== СБРОС =====
 def reset_actions():
     day = current_day_id()
     if db.get("last_day_reset") == day:
@@ -108,13 +115,11 @@ def reset_actions():
     db["last_day_reset"] = day
     save_db(db)
 
-# ===== ГЕОМЕТРИЯ СЕКТОРОВ =====
+# ===== ГЕОМЕТРИЯ =====
 def sector_id(ring, sec):
-    """ring 0..RINGS-1, sec 0..SECTORS-1 -> 'R{n}-S{m}'"""
     return f"R{ring+1}-S{sec+1}"
 
 def parse_sector(sid):
-    """'R3-S5' -> (2, 4)"""
     m = re.match(r'R(\d+)-S(\d+)', sid)
     if not m: return None
     r = int(m.group(1)) - 1
@@ -124,21 +129,17 @@ def parse_sector(sid):
     return None
 
 def neighbors(sid):
-    """Соседние сектора (общая граница)."""
     p = parse_sector(sid)
     if not p: return []
     r, s = p
     res = []
-    # Внутреннее/внешнее кольцо
     if r > 0: res.append(sector_id(r-1, s))
     if r < RINGS-1: res.append(sector_id(r+1, s))
-    # Соседи по углу (сектор слева/справа)
     res.append(sector_id(r, (s-1) % SECTORS))
     res.append(sector_id(r, (s+1) % SECTORS))
     return res
 
 def bfs_within_radius(src, radius):
-    """Все сектора в радиусе radius шагов от src (включая src)."""
     visited = {src: 0}
     q = deque([src])
     while q:
@@ -258,11 +259,11 @@ async def create_sector(message: Message, state: FSMContext):
         await message.answer('❌ Неверный сектор:'); return
     if db["sectors"].get(sector, {}).get("owner"):
         await message.answer(f'❌ Сектор <code>{sector}</code> занят!', parse_mode=ParseMode.HTML); return
-    
+
     data = await state.get_data()
     user_id = str(message.from_user.id)
     cid = str(len(db["countries"]) + 1)
-    
+
     db["countries"][cid] = {
         "name": data['name'], "color": data['color'], "president": user_id,
         "members": [user_id], "capital": sector
@@ -272,7 +273,7 @@ async def create_sector(message: Message, state: FSMContext):
     db["sectors"][sector] = {"owner": cid, "status": "captured"}
     db["worlds"][sector] = {"type": "людской", "country": cid}
     db["heroes"][user_id] = {"sector": sector, "alive": True, "respawn_at": 0}
-    
+
     save_db(db)
     await state.clear()
     await message.answer(
@@ -308,7 +309,7 @@ async def join_callback(callback: CallbackQuery):
         await callback.answer('Вы уже в стране!', show_alert=True); return
     if cid not in db["countries"]:
         await callback.answer('Страна не найдена', show_alert=True); return
-    
+
     country = db["countries"][cid]
     db["countries"][cid]["members"].append(user_id)
     db["users"][user_id] = cid
@@ -342,11 +343,12 @@ async def btn_hero(message: Message):
         f'🏛 {country.get("name", "—")}\n'
         f'📍 Сектор: <code>{hero["sector"]}</code>\n'
         f'💪 Сила: {HERO_POWER}\n\n'
-        f'.двигаться R1-S5 — переместиться\n'
-        f'.атаковать R1-S5 — атаковать',
+        f'Команды:\n'
+        f'<code>.двигаться R1-S5</code> — переместиться\n'
+        f'<code>.атаковать R1-S5</code> — атаковать',
         parse_mode=ParseMode.HTML)
 
-@dp.message(F.text.regexp(r'\.двигаться\s+(R\d+-S\d+)'))
+@dp.message(F.text.regexp(r'^\.двигаться\s+(R\d+-S\d+)$'))
 async def move_hero(message: Message):
     sector = message.text.split()[1].upper()
     user_id = str(message.from_user.id)
@@ -364,8 +366,9 @@ async def move_hero(message: Message):
     save_db(db)
     await message.answer(f'🚶 Герой в <code>{sector}</code>.', parse_mode=ParseMode.HTML)
 
-@dp.message(F.text.regexp(r'\.атаковать\s+(R\d+-S\d+)$'))
-async def hero_attack(message: Message):
+# ===== АТАКА ГЕРОЕМ (через текст) =====
+@dp.message(F.text.regexp(r'^\.атаковать\s+(R\d+-S\d+)$'))
+async def hero_attack_cmd(message: Message):
     sector = message.text.split()[1].upper()
     user_id = str(message.from_user.id)
     hero = get_hero(user_id)
@@ -377,7 +380,7 @@ async def hero_attack(message: Message):
         await message.answer('❌ Это ваш сектор.'); return
     if hero["sector"] != sector:
         await message.answer(f'❌ Герой в <code>{hero["sector"]}</code>. Переместитесь.', parse_mode=ParseMode.HTML); return
-    
+
     pending = db["pending_attacks"].setdefault(sector, [])
     pending.append({"cid": cid, "hero": user_id, "power": HERO_POWER, "timestamp": int(time.time())})
     save_db(db)
@@ -385,9 +388,11 @@ async def hero_attack(message: Message):
     other = [a for a in pending if a["cid"] != cid]
     if other:
         await resolve_pending_attacks(sector, message)
+    else:
+        await resolve_single_attack(sector, cid, message)
 
 # ===== ПЕРЕМЕЩЕНИЕ ВОЙСК =====
-@dp.message(F.text.regexp(r'\.переместить\s+(R\d+-S\d+)\s+(R\d+-S\d+)\s+(\d+)'))
+@dp.message(F.text.regexp(r'^\.переместить\s+(R\d+-S\d+)\s+(R\d+-S\d+)\s+(\d+)$'))
 async def move_troops(message: Message):
     parts = message.text.split()
     src = parts[1].upper()
@@ -399,26 +404,22 @@ async def move_troops(message: Message):
         await message.answer('❌ Только президент.'); return
     if amount <= 0:
         await message.answer('❌ Минимум 1.'); return
-    
-    # Проверка src/dst
+
     if src not in [s for s in db["sectors"] if db["sectors"][s].get("owner") == cid]:
         await message.answer(f'❌ <code>{src}</code> не ваш.', parse_mode=ParseMode.HTML); return
     if dst not in [s for s in db["sectors"] if db["sectors"][s].get("owner") == cid]:
         await message.answer(f'❌ <code>{dst}</code> не ваш.', parse_mode=ParseMode.HTML); return
     if src == dst:
         await message.answer('❌ Сектора совпадают.'); return
-    
-    # Проверка радиуса
+
     reachable = bfs_within_radius(src, MOVE_RADIUS)
     if dst not in reachable:
         await message.answer(f'❌ <code>{dst}</code> слишком далеко (радиус {MOVE_RADIUS}).', parse_mode=ParseMode.HTML); return
-    
-    # Проверка наличия войск
+
     army = db["armies"].get(cid, {}).get(src)
     if not army or army["count"] < amount:
         await message.answer(f'❌ В <code>{src}</code> нет {amount} солдат.', parse_mode=ParseMode.HTML); return
-    
-    # Перемещение
+
     army["count"] -= amount
     if army["count"] <= 0:
         del db["armies"][cid][src]
@@ -426,61 +427,186 @@ async def move_troops(message: Message):
         db["armies"][cid][dst] = {"count": 0, "acted": []}
     db["armies"][cid][dst]["count"] += amount
     save_db(db)
-    
+
     await message.answer(
         f'🚚 Перемещено <b>{amount}</b> солдат из <code>{src}</code> в <code>{dst}</code>.',
         parse_mode=ParseMode.HTML)
 
-# ===== АТАКА АРМИЕЙ (только на соседние) =====
-@dp.message(F.text.regexp(r'\.атаковать\s+(R\d+-S\d+)\s+(R\d+-S\d+)\s+(\d+)'))
-async def army_attack(message: Message):
-    parts = message.text.split()
-    src = parts[1].upper()
-    dst = parts[2].upper()
-    amount = int(parts[3])
+# ===== КНОПКА АТАКОВАТЬ =====
+@dp.message(F.text == "⚔️ Атаковать")
+async def btn_attack(message: Message, state: FSMContext):
     user_id = str(message.from_user.id)
     cid = get_user_country(user_id)
-    if not cid or not is_president(user_id, cid):
-        await message.answer('❌ Только президент.'); return
-    
-    valid = [f"R{r+1}-S{s+1}" for r in range(RINGS) for s in range(SECTORS)]
-    if src not in valid or dst not in valid:
-        await message.answer('❌ Неверные сектора.'); return
-    if src == dst:
-        await message.answer('❌ Сектора совпадают.'); return
-    if amount <= 0:
-        await message.answer('❌ Минимум 1.'); return
-    
-    # Проверка соседства
-    if not is_neighbor(src, dst):
-        await message.answer(f'❌ <code>{dst}</code> не соседний с <code>{src}</code>. Атака только на соседние!', parse_mode=ParseMode.HTML); return
-    
+    if not cid:
+        await message.answer('❌ Вы не в стране.')
+        return
+    if not is_president(user_id, cid):
+        await message.answer('❌ Только президент может командовать армией.\n'
+                             'Герои атакуют командой `.атаковать R1-S5`.')
+        return
+
+    my_armies = db["armies"].get(cid, {})
+    if not my_armies:
+        await message.answer('❌ У вас нет войск ни в одном секторе.')
+        return
+
+    buttons = []
+    for sector, data in my_armies.items():
+        total = data.get("count", 0)
+        acted = len(data.get("acted", []))
+        available = total - acted
+        if available > 0:
+            buttons.append([InlineKeyboardButton(
+                text=f"📍 {sector} — {available} готовы (из {total})",
+                callback_data=f"atk_src_{sector}"
+            )])
+
+    if not buttons:
+        await message.answer('❌ Все ваши солдаты уже сходили сегодня. Попробуйте завтра.')
+        return
+
+    await state.set_state(AttackFlow.choose_src)
+    await message.answer(
+        '⚔️ <b>Атака</b>\n\n'
+        'Выберите сектор, <b>откуда</b> пойдут войска:',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode=ParseMode.HTML
+    )
+
+@dp.callback_query(F.data.startswith("atk_src_"), AttackFlow.choose_src)
+async def atk_src_chosen(callback: CallbackQuery, state: FSMContext):
+    sector = callback.data.split("_", 2)[2]
+    user_id = str(callback.from_user.id)
+    cid = get_user_country(user_id)
+    army = db["armies"].get(cid, {}).get(sector, {})
+    available = army.get("count", 0) - len(army.get("acted", []))
+
+    await state.update_data(src=sector, max_amount=available)
+    await state.set_state(AttackFlow.choose_amount)
+
+    await callback.message.edit_text(
+        f'📍 Источник: <code>{sector}</code>\n'
+        f'Доступно солдат: <b>{available}</b>\n\n'
+        f'Введите количество солдат для атаки (от 1 до {available}):',
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+@dp.message(AttackFlow.choose_amount)
+async def atk_amount_chosen(message: Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip())
+    except ValueError:
+        await message.answer('❌ Введите число.')
+        return
+
+    data = await state.get_data()
+    max_amount = data.get("max_amount", 0)
+    if amount < 1 or amount > max_amount:
+        await message.answer(f'❌ Введите число от 1 до {max_amount}.')
+        return
+
+    await state.update_data(amount=amount)
+    await state.set_state(AttackFlow.choose_dst)
+
+    src = data["src"]
+    neighbors_list = neighbors(src)
+    buttons = []
+    for nb in neighbors_list:
+        info = db["sectors"].get(nb, {})
+        owner = info.get("owner")
+        if owner:
+            country = db["countries"].get(owner, {})
+            label = f"🏛 {country.get('name', '?')} ({nb})"
+        else:
+            label = f"🌫 Свободный ({nb})"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"atk_dst_{nb}")])
+
+    await message.answer(
+        f'🎯 Отправляем <b>{amount}</b> солдат из <code>{src}</code>.\n\n'
+        f'Выберите <b>цель</b> (только соседние сектора):',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode=ParseMode.HTML
+    )
+
+@dp.callback_query(F.data.startswith("atk_dst_"), AttackFlow.choose_dst)
+async def atk_dst_chosen(callback: CallbackQuery, state: FSMContext):
+    dst = callback.data.split("_", 2)[2]
+    user_id = str(callback.from_user.id)
+    cid = get_user_country(user_id)
+    data = await state.get_data()
+    src = data["src"]
+    amount = data["amount"]
+    await state.clear()
+
     army = db["armies"].get(cid, {}).get(src)
     if not army:
-        await message.answer(f'❌ В <code>{src}</code> нет ваших войск.', parse_mode=ParseMode.HTML); return
-    
+        await callback.message.edit_text(f'❌ В <code>{src}</code> больше нет войск.', parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
     available = army["count"] - len(army["acted"])
     if amount > available:
-        await message.answer(f'❌ В <code>{src}</code> доступно {available} солдат.', parse_mode=ParseMode.HTML); return
-    
+        await callback.message.edit_text(f'❌ В <code>{src}</code> доступно только {available} солдат.', parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
+
     army["count"] -= amount
     if army["count"] <= 0:
         del db["armies"][cid][src]
     for _ in range(amount):
         army["acted"].append(f"s_{int(time.time())}_{random.randint(1000,9999)}")
-    
+
     pending = db["pending_attacks"].setdefault(dst, [])
     pending.append({"cid": cid, "amount": amount, "from": src, "timestamp": int(time.time())})
     save_db(db)
-    
-    await message.answer(
-        f'⚔️ <b>{amount}</b> солдат из <code>{src}</code> атакуют <code>{dst}</code>!',
-        parse_mode=ParseMode.HTML)
+
+    await callback.message.edit_text(
+        f'⚔️ <b>{amount}</b> солдат из <code>{src}</code> атакуют <code>{dst}</code>!\n'
+        f'Ожидание...',
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
     other = [a for a in pending if a["cid"] != cid]
     if other:
-        await resolve_pending_attacks(dst, message)
+        await resolve_pending_attacks(dst, callback.message)
+    else:
+        await resolve_single_attack(dst, cid, callback.message)
 
-# ===== РАЗРЕШЕНИЕ =====
+# ===== ГАРНИЗОНЫ =====
+@dp.message(F.text == "📊 Гарнизоны")
+async def btn_garrisons(message: Message):
+    user_id = str(message.from_user.id)
+    cid = get_user_country(user_id)
+    if not cid:
+        await message.answer('❌ Вы не в стране.')
+        return
+
+    my_armies = db["armies"].get(cid, {})
+    if not my_armies:
+        await message.answer('📭 У вас нет войск ни в одном секторе.')
+        return
+
+    lines = ['📊 <b>Ваши гарнизоны</b>\n']
+    total_all = 0
+    total_available = 0
+    for sector, data in sorted(my_armies.items()):
+        total = data.get("count", 0)
+        acted = len(data.get("acted", []))
+        available = total - acted
+        total_all += total
+        total_available += available
+        role = ""
+        if sector in db["worlds"]:
+            role = " 🏭" if db["worlds"][sector]["type"] == "кузня" else " 🏙"
+        lines.append(
+            f'📍 <code>{sector}</code>{role}\n'
+            f'   Всего: <b>{total}</b> | Готовы: <b>{available}</b> | Ходили: {acted}'
+        )
+    lines.append(f'\n<b>Итого:</b> {total_all} солдат, из них {total_available} готовы к бою.')
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+# ===== РАЗРЕШЕНИЕ АТАК =====
 async def resolve_pending_attacks(sector, message: Message):
     pending = db["pending_attacks"].get(sector, [])
     if not pending: return
@@ -709,7 +835,7 @@ async def btn_my_country(message: Message):
         f'<b>⚔️ Гарнизоны:</b>{garrison_text or " нет"}',
         parse_mode=ParseMode.HTML)
 
-# ===== ТАБЛИЦА ЛИДЕРОВ =====
+# ===== ЛИДЕРЫ =====
 @dp.message(F.text == "🏆 Лидеры")
 async def btn_leaders(message: Message):
     countries_list = []
@@ -722,20 +848,18 @@ async def btn_leaders(message: Message):
         countries_list.append({
             "cid": cid,
             "name": c["name"],
-            "color": c["color"],
             "territories": territories,
             "army": total_army,
             "heroes": heroes_alive,
             "members": len(c["members"])
         })
-    
+
     if not countries_list:
         await message.answer('📊 Пока нет стран для рейтинга.')
         return
-    
-    # Сортировка по территориям (по убыванию), затем по армии
+
     countries_list.sort(key=lambda x: (x["territories"], x["army"]), reverse=True)
-    
+
     lines = ["🏆 <b>ДЕМОНСТРАЦИЯ СИЛЫ</b>\n"]
     medals = ["🥇", "🥈", "🥉"]
     for i, c in enumerate(countries_list):
@@ -746,7 +870,7 @@ async def btn_leaders(message: Message):
             f'⚔️ Армия: <b>{c["army"]}</b>\n'
             f'   🦸 Героев: {c["heroes"]} | 👥 Участников: {c["members"]}'
         )
-    
+
     await message.answer("\n\n".join(lines), parse_mode=ParseMode.HTML)
 
 # ===== ПОМОЩЬ =====
@@ -761,22 +885,23 @@ async def btn_help(message: Message):
         "<code>.двигаться R1-S5</code> — переместиться\n"
         "<code>.атаковать R1-S5</code> — атаковать (только соседний)\n\n"
         "<b>👑 Президент:</b>\n"
-        "• Кнопка «Произвести» — в столицу\n"
-        "<code>.переместить R1-S5 R1-S6 3</code> — перебросить 3 солдата (радиус 2, только своя территория)\n"
-        "<code>.атаковать R1-S5 R2-S3 2</code> — атаковать соседний сектор 2 солдатами\n"
+        "• Кнопка «⚔️ Атаковать» — пошаговая атака\n"
+        "• Кнопка «🏭 Произвести» — солдаты в столицу\n"
+        "• Кнопка «📊 Гарнизоны» — где сколько солдат\n"
+        "<code>.переместить R1-S5 R1-S6 3</code> — перебросить (радиус 2)\n"
         "<code>.назначить_мир R1-S5 кузня</code>\n\n"
         "<b>🏆 Лидеры:</b>\n"
-        "• Кнопка «Лидеры» — рейтинг стран\n\n"
+        "• Кнопка «Лидеры»\n\n"
         "⚔️ <b>Правила:</b>\n"
         "• Атака — только на соседний сектор\n"
         "• Перемещение — радиус 2 по своей территории\n"
         "• 1 ход на солдата в день\n"
         "• Встречный бой при атаке 2 стран на 1 сектор\n\n"
-        "📐 Формат секторов: <code>R1-S1</code> (R 1-8, S 1-24)",
+        "📐 Формат: <code>R1-S1</code> (R 1-8, S 1-24)",
         parse_mode=ParseMode.HTML)
 
 # ===== НАЗНАЧИТЬ МИР =====
-@dp.message(F.text.regexp(r'\.назначить_мир\s+(R\d+-S\d+)\s+(кузня|людской)'))
+@dp.message(F.text.regexp(r'^\.назначить_мир\s+(R\d+-S\d+)\s+(кузня|людской)$'))
 async def assign_world(message: Message):
     parts = message.text.split()
     sector, world_type = parts[1].upper(), parts[2].lower()
