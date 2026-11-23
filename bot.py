@@ -23,7 +23,7 @@ from aiogram.enums import ParseMode
 import asyncio
 
 # ===== НАСТРОЙКИ =====
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", 9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04)
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9002477184:AAEmakeUk87LgY7xkhogFRCXVwZLBbn8f04")
 DB_FILE = 'game_state.json'
 
 RINGS = 8
